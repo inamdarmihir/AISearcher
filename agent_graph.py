@@ -27,7 +27,14 @@ model = ChatOpenAI(
 )
 
 # Initialize our agents
-web_research_agent = WebResearchAgent()
+web_research_agent = WebResearchAgent(
+    max_results=8,
+    concurrent_processing=True,
+    enable_pii_detection=True,
+    enable_guardrails=True,
+    structured_output=True,
+    privacy_level="high"  # Set to high to block all privacy-sensitive queries
+)
 rag_agent = RAGAgent()
 summarization_agent = SummarizationAgent()
 

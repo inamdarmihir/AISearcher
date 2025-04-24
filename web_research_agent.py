@@ -1,12 +1,15 @@
 import os
 import time
 import traceback
+import re
+import json
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
 from exa_py import Exa
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import langchain.globals as langchain_globals  # Import for configuring LangChain caching
@@ -31,12 +34,59 @@ model = ChatOpenAI(
     temperature=0,
 )
 
+# Pydantic model for structured research output
+class ResearchOutput(BaseModel):
+    """Structured format for research information extracted from sources."""
+    summary: str = Field(..., description="A brief 1-2 sentence summary of the findings")
+    main_findings: List[str] = Field(..., description="List of 3-5 key findings related to the query")
+    detailed_analysis: str = Field(..., description="Comprehensive analysis of the information found")
+    sources: List[Dict[str, str]] = Field(..., description="List of sources used, each with title and URL")
+
+# PII patterns for identification
+PII_PATTERNS = {
+    'email': r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+    'phone_number': r'\b(\+\d{1,2}\s)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b',
+    'ssn': r'\b\d{3}-\d{2}-\d{4}\b',
+    'credit_card': r'\b(?:\d{4}[- ]?){3}\d{4}\b',
+    'ip_address': r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
+}
+
+# Input guardrails - blocked topics and patterns
+BLOCKED_TOPICS = [
+    'hack', 'exploit', 'vulnerability', 'illegal', 'bomb', 'terrorist',
+    'child abuse', 'pornography', 'murder', 'suicide', 'self-harm',
+]
+
+# Privacy-sensitive query patterns - detect requests for personal information
+PRIVACY_PATTERNS = [
+    # Critical privacy concerns - always block
+    (r'\b(home|house|residential|private|personal|family)\s+(address|location|residence)\b', 'home address', 'critical'),
+    (r'\b(where|location).+(live|lives|living|reside|resides|residing)\b', 'residence location', 'critical'),
+    (r'\b(address|location).+(celebrity|actor|actress|athlete|player|politician|star)\b', 'celebrity address', 'critical'),
+    (r'\b(phone|contact|email|social)\s+(number|details|address|information)\b', 'contact information', 'critical'),
+    (r'\b(credit\s+card|bank\s+account|financial)\s+(details|information|data)\b', 'financial information', 'critical'),
+    (r'\b(SSN|social\s+security|national\s+id|passport|driver\'s\s+license)\b', 'identification numbers', 'critical'),
+    
+    # Moderate privacy concerns - configurable blocking
+    (r'\b(date|day)\s+of\s+(birth|birthday)\b', 'date of birth', 'moderate'),
+    (r'\b(birth|born).+(date|day|year)\b', 'birth date', 'moderate'),
+    (r'\b(age|how\s+old)\b', 'age', 'moderate'),
+    (r'\b(marital|marriage|relationship)\s+(status|history)\b', 'marital status', 'moderate'),
+    (r'\b(salary|income|earnings|net\s+worth)\b', 'financial status', 'moderate'),
+    (r'\b(family|children|kids|spouse|wife|husband|partner)\b', 'family details', 'moderate'),
+    
+    # Public information about public figures - warning only
+    (r'\b(career|achievements|records|statistics|stats|biography|profile)\b', 'public profile', 'low'),
+]
+
 class WebResearchAgent:
     """
-    Agent for performing web research using Exa API.
+    Agent for performing web research using Exa API with guardrails and PII protection.
     """
     
-    def __init__(self, max_results: int = 8, max_retries: int = 3, concurrent_processing: bool = True):
+    def __init__(self, max_results: int = 8, max_retries: int = 3, concurrent_processing: bool = True, 
+                 enable_pii_detection: bool = True, enable_guardrails: bool = True, 
+                 structured_output: bool = True, privacy_level: str = "high"):
         """
         Initialize the web research agent.
         
@@ -44,10 +94,23 @@ class WebResearchAgent:
             max_results: Maximum number of search results to retrieve
             max_retries: Maximum number of retries for API calls
             concurrent_processing: Whether to process results concurrently
+            enable_pii_detection: Whether to enable PII detection and redaction
+            enable_guardrails: Whether to enable input and output guardrails
+            structured_output: Whether to use structured output format
+            privacy_level: Level of privacy enforcement ('low', 'medium', 'high')
         """
         self.max_results = max_results
         self.max_retries = max_retries
         self.concurrent_processing = concurrent_processing
+        self.enable_pii_detection = enable_pii_detection
+        self.enable_guardrails = enable_guardrails
+        self.structured_output = structured_output
+        self.privacy_level = privacy_level.lower()
+        
+        # Validate privacy level
+        if self.privacy_level not in ['low', 'medium', 'high']:
+            print(f"Invalid privacy level '{privacy_level}', defaulting to 'high'")
+            self.privacy_level = 'high'
         
         # Create the extraction prompt with improved instructions for deeper analysis
         self.extraction_prompt = ChatPromptTemplate.from_messages([
@@ -86,6 +149,15 @@ For information about specific products or technologies:
 If the search results don't contain relevant information, clearly state what specific information is missing 
 and suggest what more specialized sources might have better information on this topic.
 
+IMPORTANT GUARDRAILS:
+1. DO NOT include any personally identifiable information (PII) such as non-public email addresses, phone numbers, 
+   physical addresses, or other private contact information.
+2. DO NOT generate harmful, illegal, unethical or deceptive content.
+3. If asked about topics like hacking, exploits, or illegal activities, refuse to provide specific details 
+   that could enable harm.
+4. Maintain a factual, neutral tone and avoid politically biased language.
+5. Cite sources for all significant claims and avoid making unsubstantiated assertions.
+
 Synthesize the information into a coherent, well-organized response. Use clear headings to separate different aspects.
 ALWAYS cite your sources for each piece of information, using the format: [Source Title: URL].
 """),
@@ -98,8 +170,43 @@ Search Results:
 Provide a comprehensive analysis that directly answers the query with in-depth, detailed information.
 """)
         ])
+
+        # Define structured output parser if enabled
+        if self.structured_output:
+            # Define the structured output prompt
+            self.structured_extraction_prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are an expert web research agent that extracts and organizes information from search results.
+                
+Your task is to analyze the provided search results and extract ALL relevant information related to the user's query.
+Structure your response using the following format:
+1. A brief summary (1-2 sentences)
+2. 3-5 key findings as bullet points
+3. A comprehensive analysis with clearly marked sections
+4. A list of sources used
+
+Follow the same research guidelines and guardrails as the standard extraction but format your output 
+in a structured JSON format that follows the specified schema.
+
+IMPORTANT GUARDRAILS:
+1. DO NOT include any personally identifiable information (PII) such as email addresses, phone numbers, or addresses.
+2. DO NOT generate harmful, illegal, unethical, or deceptive content.
+3. Maintain a factual, neutral tone and avoid biased language.
+4. Cite sources for all claims and avoid making unsubstantiated assertions.
+"""),
+                ("human", """
+Query: {query}
+
+Search Results:
+{search_results}
+
+Provide a comprehensive analysis in the required structured format.
+""")
+            ])
+            
+            # Create the extraction chain with structured output
+            self.structured_extraction_chain = self.structured_extraction_prompt | model | JsonOutputParser()
         
-        # Create the extraction chain
+        # Create the standard extraction chain
         self.extraction_chain = self.extraction_prompt | model | StrOutputParser()
     
     def search(self, query: str) -> List[Dict[str, Any]]:
@@ -399,6 +506,103 @@ Provide a comprehensive analysis that directly answers the query with in-depth, 
             
         return formatted_results
     
+    def check_guardrails(self, query: str) -> Dict[str, Any]:
+        """
+        Check if a query violates input guardrails.
+        
+        Args:
+            query: The query to check
+            
+        Returns:
+            Dictionary with pass status and reason for failure if any
+        """
+        if not self.enable_guardrails:
+            return {"pass": True, "reason": None}
+            
+        # Check for blocked topics
+        query_lower = query.lower()
+        for topic in BLOCKED_TOPICS:
+            if topic in query_lower:
+                return {
+                    "pass": False,
+                    "reason": f"Query contains potentially harmful or inappropriate content: '{topic}'",
+                    "category": "harmful_content"
+                }
+        
+        # Check for privacy-sensitive patterns with respect to configured privacy level
+        for pattern, description, severity in PRIVACY_PATTERNS:
+            if re.search(pattern, query_lower, re.IGNORECASE):
+                # Determine if this should be blocked based on privacy level
+                should_block = False
+                
+                if severity == 'critical':
+                    # Critical privacy concerns are always blocked
+                    should_block = True
+                elif severity == 'moderate':
+                    # Moderate concerns blocked at medium and high privacy levels
+                    should_block = self.privacy_level in ['medium', 'high']
+                elif severity == 'low':
+                    # Low concerns only blocked at high privacy level
+                    should_block = self.privacy_level == 'high'
+                
+                if should_block:
+                    return {
+                        "pass": False,
+                        "reason": f"Query appears to be requesting personal or private information ({description}). " +
+                                "For privacy and ethical reasons, we cannot provide specific personal details about individuals.",
+                        "category": "privacy_violation",
+                        "severity": severity
+                    }
+                else:
+                    # If not blocking, we'll still log the concern
+                    print(f"Privacy concern detected but allowed by current privacy level: {description} (severity: {severity})")
+        
+        # Check query length - prevent excessively long queries
+        if len(query) > 1000:
+            return {
+                "pass": False,
+                "reason": "Query exceeds maximum allowed length (1000 characters)",
+                "category": "excessive_length"
+            }
+            
+        # Check for excessive special characters or potential code injection
+        special_char_percentage = sum(1 for c in query if not c.isalnum() and not c.isspace()) / len(query) if query else 0
+        if special_char_percentage > 0.3:  # If more than 30% are special characters
+            return {
+                "pass": False,
+                "reason": "Query contains an unusually high percentage of special characters",
+                "category": "suspicious_characters"
+            }
+            
+        return {"pass": True, "reason": None, "category": None}
+    
+    def detect_and_redact_pii(self, text: str) -> str:
+        """
+        Detect and redact personally identifiable information (PII) from text.
+        
+        Args:
+            text: The text to process
+            
+        Returns:
+            Text with PII redacted
+        """
+        if not self.enable_pii_detection or not text:
+            return text
+            
+        redacted_text = text
+        
+        # Apply each PII detection pattern
+        for pii_type, pattern in PII_PATTERNS.items():
+            # Find all matches
+            matches = re.finditer(pattern, redacted_text)
+            
+            # Replace matches with redacted indicator
+            for match in matches:
+                pii_value = match.group()
+                redacted_text = redacted_text.replace(pii_value, f"[REDACTED {pii_type.upper()}]")
+                
+        return redacted_text
+    
     def extract_information(self, query: str, search_results: str) -> str:
         """
         Extract comprehensive information from search results.
@@ -416,6 +620,22 @@ Provide a comprehensive analysis that directly answers the query with in-depth, 
             if search_results == "No search results were found for this query.":
                 return f"No specific information was found regarding '{query}'. This could indicate that either no such information exists, or that more specialized sources might be needed for this query."
             
+            # Add a secondary privacy check for patterns that weren't blocked
+            # but should get a disclaimer - useful for 'allowed but concerning' queries
+            privacy_disclaimer = ""
+            
+            # Only check lower severity patterns that we didn't block earlier
+            for pattern, description, severity in [p for p in PRIVACY_PATTERNS if p[2] in ['low', 'moderate']]:
+                if re.search(pattern, query.lower(), re.IGNORECASE):
+                    # For public figures, we may still allow the query but add a disclaimer
+                    if self._is_likely_public_figure(query):
+                        privacy_disclaimer = f"""
+> **Note on Personal Information**: This information about {self._extract_name(query)} is publicly available 
+> as they are a public figure. We only provide information that is already in the public domain.
+> We respect privacy and do not share private personal details that are not publicly disclosed.
+"""
+                        break
+            
             print(f"Extracting comprehensive information for query: '{query}'")
             
             # Break the extraction into chunks if the search results are very large
@@ -423,16 +643,49 @@ Provide a comprehensive analysis that directly answers the query with in-depth, 
             result_length = len(search_results)
             print(f"Total search results length: {result_length} characters")
             
+            # Process differently based on size and output format
             if result_length > 30000:
                 print("Search results are very large, breaking into chunks for processing")
                 # Process in multiple chunks and combine results
                 results = self._extract_from_large_results(query, search_results)
             else:
-                # Process normally for reasonable-sized results
-                results = self.extraction_chain.invoke({
-                    "query": query,
-                    "search_results": search_results
-                })
+                # Process based on output format preference
+                if self.structured_output:
+                    try:
+                        print("Using structured output format")
+                        results_dict = self.structured_extraction_chain.invoke({
+                            "query": query,
+                            "search_results": search_results
+                        })
+                        
+                        # Convert structured output to formatted string
+                        results = self._format_structured_output(results_dict)
+                    except Exception as struct_e:
+                        print(f"Error in structured extraction: {struct_e}, falling back to standard extraction")
+                        # Fall back to standard extraction on error
+                        results = self.extraction_chain.invoke({
+                            "query": query,
+                            "search_results": search_results
+                        })
+                else:
+                    # Standard extraction
+                    results = self.extraction_chain.invoke({
+                        "query": query,
+                        "search_results": search_results
+                    })
+            
+            # Apply PII detection if enabled
+            if self.enable_pii_detection:
+                results = self.detect_and_redact_pii(results)
+            
+            # Add privacy disclaimer if present
+            if privacy_disclaimer:
+                # Insert after the first heading if possible
+                if "# " in results:
+                    parts = results.split("# ", 1)
+                    results = parts[0] + "# " + parts[1].split("\n", 1)[0] + "\n" + privacy_disclaimer + "\n" + parts[1].split("\n", 1)[1]
+                else:
+                    results = privacy_disclaimer + "\n" + results
             
             print(f"Information extraction completed in {time.time() - start_time:.2f} seconds")
             return results
@@ -559,6 +812,61 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
             # Fall back to simple concatenation if synthesis fails
             return "# Combined Research Results\n\n" + "\n\n## Next Section\n\n".join(extracted_sections)
     
+    def _format_structured_output(self, results_dict: Dict[str, Any]) -> str:
+        """
+        Format structured output dictionary into a readable string format.
+        
+        Args:
+            results_dict: Dictionary containing structured research results
+            
+        Returns:
+            Formatted string version of the structured results
+        """
+        try:
+            # Handle the case where we might get a string instead of a dict
+            if isinstance(results_dict, str):
+                try:
+                    results_dict = json.loads(results_dict)
+                except:
+                    return results_dict  # Return as is if can't parse
+            
+            # Build the formatted output
+            output = "# Research Results\n\n"
+            
+            # Add summary
+            if "summary" in results_dict:
+                output += f"## Summary\n{results_dict['summary']}\n\n"
+            
+            # Add key findings
+            if "main_findings" in results_dict and results_dict["main_findings"]:
+                output += "## Key Findings\n"
+                for i, finding in enumerate(results_dict["main_findings"], 1):
+                    output += f"{i}. {finding}\n"
+                output += "\n"
+            
+            # Add detailed analysis
+            if "detailed_analysis" in results_dict:
+                output += f"## Detailed Analysis\n{results_dict['detailed_analysis']}\n\n"
+            
+            # Add sources
+            if "sources" in results_dict and results_dict["sources"]:
+                output += "## Sources\n"
+                for source in results_dict["sources"]:
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        output += f"- [{source['title']}]({source['url']})\n"
+                    elif isinstance(source, str):
+                        output += f"- {source}\n"
+                output += "\n"
+            
+            return output
+        except Exception as format_e:
+            print(f"Error formatting structured output: {format_e}")
+            # If formatting fails, try to return the raw dictionary as a string
+            try:
+                return json.dumps(results_dict, indent=2)
+            except:
+                return str(results_dict)
+    
     def research(self, query: str) -> Dict[str, Any]:
         """
         Perform comprehensive web research for the given query.
@@ -570,6 +878,44 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
             Dictionary containing research results and metadata
         """
         total_start_time = time.time()
+        
+        # Check input guardrails first if enabled
+        if self.enable_guardrails:
+            guardrail_check = self.check_guardrails(query)
+            if not guardrail_check["pass"]:
+                print(f"Guardrail violation detected: {guardrail_check['reason']}")
+                privacy_message = ""
+                
+                # Generate a more specific message for privacy violations
+                if guardrail_check.get("category") == "privacy_violation":
+                    privacy_message = f"""# Privacy Protection Notice
+
+This query appears to be requesting personal or private information ({guardrail_check.get('severity', 'high')} sensitivity). For privacy, ethical, and security reasons, we cannot process requests seeking personal details about individuals, including:
+
+- Home addresses or residential locations
+- Personal contact information (email addresses, phone numbers)
+- Financial details or identification numbers
+- Private personal data such as date of birth, age, marital status
+- Other non-public personal information
+
+Instead, we suggest:
+
+1. Focusing on publicly available information about the individual's professional work, career, or achievements
+2. Using official contact forms on websites if you need to reach someone professionally
+3. Connecting through professional networking platforms where individuals choose to share contact information
+
+We're committed to respecting privacy and adhering to responsible AI practices.
+"""
+                
+                return {
+                    "query": query,
+                    "success": False,
+                    "error": "Guardrail violation",
+                    "information": privacy_message or f"Unable to process this query: {guardrail_check['reason']}. Please try a different query.",
+                    "sources": [],
+                    "is_structured": False
+                }
+        
         try:
             # Add retry mechanism for the entire research process
             for research_attempt in range(2):  # Try up to 2 times for the whole research process
@@ -670,7 +1016,8 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
                             "success": success,
                             "error": "",
                             "information": extracted_info,
-                            "sources": sources
+                            "sources": sources,
+                            "is_structured": self.structured_output
                         }
                         
                         print(f"Research completed successfully in {time.time() - total_start_time:.2f} seconds")
@@ -688,7 +1035,8 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
                             "success": False,
                             "error": error_message,
                             "information": extracted_info if not extracted_info.startswith("Failed") else f"No specific information was found regarding '{query}'. This could indicate that either no such information exists, or that more specialized sources might be needed for this query.",
-                            "sources": sources
+                            "sources": sources,
+                            "is_structured": self.structured_output
                         }
                         
                         print(f"Research completed with partial success in {time.time() - total_start_time:.2f} seconds")
@@ -708,7 +1056,8 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
                 "success": False,
                 "error": "Research process failed after all attempts",
                 "information": f"Unable to find reliable information about '{query}' after multiple attempts. Please try rephrasing your query or try a different topic.",
-                "sources": []
+                "sources": [],
+                "is_structured": False
             }
             
         except Exception as e:
@@ -722,18 +1071,68 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
                 "success": False,
                 "error": str(e),
                 "information": f"An error occurred while researching '{query}': {str(e)}. Please try a different query or approach.",
-                "sources": []
+                "sources": [],
+                "is_structured": False
             }
+    
+    def _is_likely_public_figure(self, query: str) -> bool:
+        """
+        Determine if a query is likely about a public figure.
+        
+        Args:
+            query: The query string
+            
+        Returns:
+            Boolean indicating if the query likely refers to a public figure
+        """
+        # Extract the potential name from the query
+        name = self._extract_name(query)
+        if not name:
+            return False
+            
+        # Check if we have search results for this name
+        # (This is a simplistic approach - in production, you might check against a database of known public figures)
+        return True  # For now, we'll assume names in queries are public figures
+        
+    def _extract_name(self, query: str) -> str:
+        """
+        Extract a potential name from the query.
+        
+        Args:
+            query: The query string
+            
+        Returns:
+            Extracted name or empty string
+        """
+        # Simple extraction - get the first part before possessive or preposition
+        for splitter in ["'s", " of ", " for ", " about "]:
+            if splitter in query:
+                return query.split(splitter)[0].strip()
+                
+        # If no splitter found, try to extract the first 2-3 words as a name
+        words = query.split()
+        if len(words) >= 2:
+            return " ".join(words[:min(3, len(words))])
+            
+        return query  # Just return the whole query if we can't extract a name
 
 # Test the web research agent
 if __name__ == "__main__":
-    agent = WebResearchAgent(max_results=8, concurrent_processing=True)
+    agent = WebResearchAgent(
+        max_results=8, 
+        concurrent_processing=True,
+        enable_pii_detection=True,
+        enable_guardrails=True,
+        structured_output=True,
+        privacy_level="high"  # Options: "low", "medium", "high"
+    )
     start = time.time()
     result = agent.research("What are the latest developments in quantum computing?")
     end = time.time()
     
     print(f"\nQuery: {result['query']}")
     print(f"Success: {result['success']}")
+    print(f"Structured output: {result.get('is_structured', False)}")
     print(f"Total research time: {end - start:.2f} seconds")
     
     if result['success']:
