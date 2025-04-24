@@ -571,96 +571,146 @@ Synthesize these sections into a single, comprehensive response that thoroughly 
         """
         total_start_time = time.time()
         try:
-            # Perform search
-            print(f"Starting search for query: {query}")
-            search_results = self.search(query)
-            print(f"Search returned {len(search_results) if search_results else 0} results")
-            
-            # Check search results type and format
-            if search_results is None:
-                print("Warning: search_results is None, converting to empty list")
-                search_results = []
-            
-            if not isinstance(search_results, list):
-                print(f"Warning: search_results is not a list but {type(search_results)}, converting to list")
+            # Add retry mechanism for the entire research process
+            for research_attempt in range(2):  # Try up to 2 times for the whole research process
                 try:
-                    search_results = list(search_results) if hasattr(search_results, '__iter__') else []
-                except Exception as convert_e:
-                    print(f"Error converting search_results to list: {convert_e}")
-                    search_results = []
-            
-            # Format search results
-            try:
-                format_start = time.time()
-                formatted_results = self.format_search_results(search_results)
-                print(f"Formatted results length: {len(formatted_results) if formatted_results else 0}")
-                print(f"Formatting completed in {time.time() - format_start:.2f} seconds")
-            except Exception as format_e:
-                print(f"Error formatting search results: {format_e}")
-                formatted_results = "No search results were found for this query."
-            
-            # Extract information
-            try:
-                print("Extracting information from search results...")
-                extracted_info = self.extract_information(query, formatted_results)
-                print("Information extraction completed")
-            except Exception as extract_e:
-                print(f"Error extracting information: {extract_e}")
-                extracted_info = f"Failed to extract information: {str(extract_e)}"
-            
-            # Collect sources with extra safety checks
-            sources = []
-            if search_results:
-                try:
-                    print("Processing sources...")
-                    for i, result in enumerate(search_results):
-                        if result is None:
-                            print(f"Skipping None result at index {i}")
-                            continue
-                        
-                        # Extra defensive coding - check if result is of expected type
-                        if not isinstance(result, dict):
-                            print(f"Result at index {i} is not a dictionary but {type(result)}")
-                            
-                            # If result is not a dict, try to convert it or create a placeholder
-                            if hasattr(result, '__dict__'):
-                                print(f"Converting object to dictionary at index {i}")
-                                result = result.__dict__
-                            else:
-                                print(f"Creating placeholder for result at index {i}")
-                                result = {}
-                        
-                        title = self.get_attribute(result, "title", "No title")
-                        url = self.get_attribute(result, "url", "No URL")
-                        published_date = self.get_attribute(result, "published_date", "Unknown date")
-                        
-                        source = {
-                            "title": title, 
-                            "url": url,
-                            "published_date": published_date
-                        }
-                        sources.append(source)
+                    # Perform search
+                    print(f"Starting search for query: {query}")
+                    search_results = self.search(query)
+                    print(f"Search returned {len(search_results) if search_results else 0} results")
                     
-                    print(f"Processed {len(sources)} sources")
-                except Exception as source_e:
-                    print(f"Error processing sources: {source_e}")
-                    # Continue with empty sources rather than failing
+                    # Check search results type and format
+                    if search_results is None:
+                        print("Warning: search_results is None, converting to empty list")
+                        search_results = []
+                    
+                    if not isinstance(search_results, list):
+                        print(f"Warning: search_results is not a list but {type(search_results)}, converting to list")
+                        try:
+                            search_results = list(search_results) if hasattr(search_results, '__iter__') else []
+                        except Exception as convert_e:
+                            print(f"Error converting search_results to list: {convert_e}")
+                            search_results = []
+                    
+                    # If no results found and this is first attempt, try again with a reformulated query
+                    if not search_results and research_attempt == 0:
+                        print("No results found on first attempt, trying with alternative query formulation")
+                        # Remove apostrophes and reformat
+                        alternative_query = query.replace("'s", "").replace("'", "")
+                        if alternative_query != query:
+                            print(f"Retrying with alternative query: '{alternative_query}'")
+                            search_results = self.search(alternative_query)
+                            print(f"Alternative search returned {len(search_results) if search_results else 0} results")
+                    
+                    # Format search results
+                    try:
+                        format_start = time.time()
+                        formatted_results = self.format_search_results(search_results)
+                        print(f"Formatted results length: {len(formatted_results) if formatted_results else 0}")
+                        print(f"Formatting completed in {time.time() - format_start:.2f} seconds")
+                    except Exception as format_e:
+                        print(f"Error formatting search results: {format_e}")
+                        formatted_results = "No search results were found for this query."
+                    
+                    # Extract information
+                    try:
+                        print("Extracting information from search results...")
+                        extracted_info = self.extract_information(query, formatted_results)
+                        print("Information extraction completed")
+                    except Exception as extract_e:
+                        print(f"Error extracting information: {extract_e}")
+                        extracted_info = f"Failed to extract information: {str(extract_e)}"
+                    
+                    # Collect sources with extra safety checks
                     sources = []
+                    if search_results:
+                        try:
+                            print("Processing sources...")
+                            for i, result in enumerate(search_results):
+                                if result is None:
+                                    print(f"Skipping None result at index {i}")
+                                    continue
+                                
+                                # Extra defensive coding - check if result is of expected type
+                                if not isinstance(result, dict):
+                                    print(f"Result at index {i} is not a dictionary but {type(result)}")
+                                    
+                                    # If result is not a dict, try to convert it or create a placeholder
+                                    if hasattr(result, '__dict__'):
+                                        print(f"Converting object to dictionary at index {i}")
+                                        result = result.__dict__
+                                    else:
+                                        print(f"Creating placeholder for result at index {i}")
+                                        result = {}
+                                
+                                title = self.get_attribute(result, "title", "No title")
+                                url = self.get_attribute(result, "url", "No URL")
+                                published_date = self.get_attribute(result, "published_date", "Unknown date")
+                                
+                                source = {
+                                    "title": title, 
+                                    "url": url,
+                                    "published_date": published_date
+                                }
+                                sources.append(source)
+                            
+                            print(f"Processed {len(sources)} sources")
+                        except Exception as source_e:
+                            print(f"Error processing sources: {source_e}")
+                            # Continue with empty sources rather than failing
+                            sources = []
+                    
+                    # Determine success based on whether we got useful information and it's not just an error message
+                    success = len(search_results) > 0 and not extracted_info.startswith("Failed to extract information")
+                    
+                    # If this attempt was successful, return the results
+                    if success:
+                        result = {
+                            "query": query,
+                            "success": success,
+                            "error": "",
+                            "information": extracted_info,
+                            "sources": sources
+                        }
+                        
+                        print(f"Research completed successfully in {time.time() - total_start_time:.2f} seconds")
+                        return result
+                    
+                    # If we failed but have more attempts, try again
+                    if research_attempt < 1:
+                        print(f"Research attempt {research_attempt+1} failed, retrying...")
+                        time.sleep(1)  # Brief pause before retrying
+                    else:
+                        # Return the best we've got on the last attempt
+                        error_message = "No search results found or extraction failed"
+                        result = {
+                            "query": query,
+                            "success": False,
+                            "error": error_message,
+                            "information": extracted_info if not extracted_info.startswith("Failed") else f"No specific information was found regarding '{query}'. This could indicate that either no such information exists, or that more specialized sources might be needed for this query.",
+                            "sources": sources
+                        }
+                        
+                        print(f"Research completed with partial success in {time.time() - total_start_time:.2f} seconds")
+                        return result
+                        
+                except Exception as attempt_e:
+                    print(f"Error in research attempt {research_attempt+1}: {attempt_e}")
+                    if research_attempt < 1:
+                        print("Retrying the research process...")
+                        time.sleep(1)
+                    else:
+                        raise  # Re-raise on the last attempt
             
-            # Determine success based on whether we got useful information and it's not just an error message
-            success = len(search_results) > 0 and not extracted_info.startswith("Failed to extract information")
-            error_message = "" if success else "No search results found or extraction failed"
-            
-            result = {
+            # This should not be reached due to the returns above
+            return {
                 "query": query,
-                "success": success,
-                "error": error_message,
-                "information": extracted_info,
-                "sources": sources
+                "success": False,
+                "error": "Research process failed after all attempts",
+                "information": f"Unable to find reliable information about '{query}' after multiple attempts. Please try rephrasing your query or try a different topic.",
+                "sources": []
             }
             
-            print(f"Research completed successfully in {time.time() - total_start_time:.2f} seconds")
-            return result
         except Exception as e:
             total_time = time.time() - total_start_time
             print(f"Error in web research: {e}")
